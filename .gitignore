@@ -1,0 +1,13 @@
+*.pt
+*.pth
+*.pyc
+*.safetensors
+__pycache__/
+_orig/
+_tmp_port_cfg.json
+hf_export/
+runs/
+trainer/transformer-1.3B-100B/
+wandb/
+*.log
+.claude/

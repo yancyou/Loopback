@@ -1,0 +1,19 @@
+# The plain-PyTorch model (looped_transformer.py and the readers) needs only torch.
+torch>=2.4
+
+# The fused Loopback read (LOOP_DATTN_FUSED=1) needs Triton on an NVIDIA GPU.
+triton>=3.0
+
+# Training (trainer/) and the trainer-side tests: flame's dependencies, pinned versions in trainer/README.md.
+transformers
+datasets
+huggingface-hub
+flash-linear-attention
+flash-attn
+torchtitan
+pyarrow
+
+# Evaluation: validation loss and extra iterations need datasets + transformers (the tokenizer); downstream tasks
+# need lm-eval (0.4.12 was used); the math / code evaluation needs pandas.
+lm-eval==0.4.12
+pandas

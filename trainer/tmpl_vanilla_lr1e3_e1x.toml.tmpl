@@ -1,0 +1,64 @@
+[model]
+config = "__TOK__"
+tokenizer_path = "__TOK__"
+[job]
+dump_folder = "exp"
+print_args = false
+[training]
+batch_size = 16
+seq_len = 4096
+context_len = 4096
+gradient_accumulation_steps = 1
+steps = __STEPS__
+max_norm = 1.0
+skip_nan_inf = true
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = -1
+tensor_parallel_degree = 1
+compile = false
+data_files = "__DATA__"
+dataset = "arrow"
+dataset_name = "default"
+dataset_split = "train"
+num_workers = 4
+pin_memory = false
+persistent_workers = false
+prefetch_factor = 2
+streaming = false
+seed = 42
+varlen = false
+fsdp_reshard_after_forward = "never"
+[optimizer]
+name = "AdamW"
+weight_decay = 0.0
+wd_params = "all"
+beta1 = 0.9
+beta2 = 0.95
+eps = 1e-15
+lr = 1e-3
+[lr_scheduler]
+warmup_steps = 128
+decay_ratio = 0.1
+decay_type = "sqrt"
+lr_min = 0.0
+[checkpoint]
+enable_checkpoint = true
+folder = "checkpoint"
+interval_type = "steps"
+interval = 2184
+model_weights_only = false
+export_dtype = "float32"
+async_mode = "disabled"
+keep_latest_k = 0
+load_step = -1
+[profiling]
+enable_profiling = false
+[metrics]
+log_freq = 10
+enable_wandb = false
+[experimental]
+context_parallel_degree = 1
+[float8]
+enable_fsdp_float8_all_gather = false
+[activation_checkpoint]
+mode = "none"
