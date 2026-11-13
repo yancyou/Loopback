@@ -135,7 +135,8 @@ class LoopDeltaAttnRes(nn.Module):
         """`keys`, if given, is a caller-owned list (one entry per stored update, extended here by one) caching
         each update's RMSNorm scale (fused read) or normalized key (reference read), so a forward pass normalizes
         every update once. `stack` (fused read only) is the pass's fused_dattn.DattnStack: the updates are its
-        slices and the kernels index it directly (the same results bitwise, a faster backward)."""
+        slices and the kernels index it directly (a faster backward; the list layout's results bitwise, or to fp32
+        round-off when the stack also holds the scores, LOOP_DATTN_DOTS=1, the default)."""
         if not 0 <= block_idx < self.num_blocks:
             raise ValueError(f"delta_attnres block_idx={block_idx}, need [0,{self.num_blocks})")
         step = loop_idx * self.num_blocks + block_idx
@@ -436,8 +437,11 @@ class LoopedTransformerModel(LoopedTransformerPreTrainedModel):
         dattn_stack = None    # fused read: the updates in one stack, their gradients accumulated in the kernels
         if (mode == "delta_attnres" and not self.gradient_checkpointing and _fused_dattn()
                 and os.environ.get("LOOP_DATTN_STACK", "1") == "1"):
+            scores = os.environ.get("LOOP_DATTN_DOTS", "1") == "1"    # each write stores its scores for the reads
             dattn_stack = _fused_dattn().DattnStack(self.loop_dattn.num_steps, tuple(inputs_embeds.shape),
-                                                    inputs_embeds.dtype, inputs_embeds.device)
+                                                    inputs_embeds.dtype, inputs_embeds.device,
+                                                    query=self.loop_dattn.query if scores else None,
+                                                    eps=self.loop_dattn.eps)
 
         for layer_idx, layer in enumerate(self.layers):
             # ---- before a block application ----

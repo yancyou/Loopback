@@ -25,6 +25,14 @@ writes its gradient once:
 where g and gt are the upstream gradients of out and tc. Numerics: fp32 scores from the source dtype, fp32 softmax
 and accumulation, one rounding of out to the source dtype (the reference accumulates the correction in the source
 dtype, so on bf16 sources the fused read is the more accurate of the two).
+
+The trainer's stacked layout (DattnStack: the updates of a forward pass in one tensor) has a second forward. Built with
+the read queries, the stack's write of update s stores v_s = h - x, its RMS scale and its dot products with every read
+query in one pass over the update (fp32 dot products: three-pass TF32 on the tensor cores), and a read then forms its
+softmax from the stored scores and streams the stack once for out = base + sum_i (tc_i - cbar_i) v_i, instead of
+running the online softmaxes, whose accumulators are rescaled at every source. Its outputs are the online kernel's up to
+the fp32 summation order (the zero-query identity tc == c0, out == base then holds to fp32 round-off rather than by
+construction); the backward kernels are the same.
 """
 from __future__ import annotations
 
@@ -40,6 +48,8 @@ _BWD_WARPS = 4
 _BWD_TILES = 0          # tiles per backward program; 0 = the old rule (4 if n_tiles >= 4096 else 1)
 _BWD2_TILE = 4096       # pass-2 tile (BLOCK_T * BLOCK_D); 4 tokens at d 1024 (sweep 11-07: 4096 / 4 warps)
 _BWD2_WARPS = 4
+_WR_CH, _WR_BT, _WR_WARPS = 64, 32, 4     # stacked write with scores: d chunk, tokens per program, warps
+_FD_CH, _FD_BT, _FD_WARPS = 256, 16, 4    # read with stored scores: d per program, tokens per program, warps
 
 
 @triton.jit
@@ -362,6 +372,7 @@ class FusedDattnReadAcc(torch.autograd.Function):
         dv = [acc.bufs[i] for i in range(n)]
         dq, g_out, dcbar_v, dr = _backward_impl(ctx, g, gt, dv, accum=not first)
         final = [i == step or (step == 1 and i == 0) for i in range(n)]
+        ctx.acc = None                    # release the buffers from this node (see FusedDattnReadStk.backward)
         return (None, None, dq, g_out, dcbar_v, None, *[dv[i] if final[i] else None for i in range(n)], *dr)
 
 
@@ -541,6 +552,80 @@ def _rstd_bwd_acc_kernel(X, R, GR, DV, n_tok, D: tl.constexpr, BLOCK_D: tl.const
     tl.store(DV + toks[:, None] * D + offs[None, :], (prev + gx).to(DV.dtype.element_ty), mask=mask2)
 
 
+# The stacked layout's forward with stored scores (a DattnStack built with the read queries):
+# _write_stk_kernel: V[s] = h - x; R[s] = rsqrt(mean(V[s]^2) + eps) from the rounded update, as _rstd_fwd_kernel reads
+#   it; DOTS[j, t, s] = q_j . V[s, t] for every read query j -- one pass over the update.
+# _dattn_fwd_dots_kernel: a read from the stored scores: the softmax over sources 0..S-1 from DOTS[step - 1] and R
+#   (scalars per token and source), then out = base + sum_i (tc_i - cbar_i) v_i as one pass over the stack, tiled over
+#   tokens x d. Outputs (out, TC, LSE, LSE0, LG) are _dattn_fwd_stk_kernel's up to the fp32 summation order.
+@triton.jit
+def _write_stk_kernel(H, X, V, R, QT, DOTS, n_tok, S, NQ, NS, eps, D: tl.constexpr, CH: tl.constexpr, BT: tl.constexpr,
+                      NQP: tl.constexpr):
+    pid = tl.program_id(0).to(tl.int64)
+    toks = pid * BT + tl.arange(0, BT).to(tl.int64)
+    tmask = toks < n_tok
+    jj = tl.arange(0, NQP)
+    jmask = jj < NQ
+    ss = tl.zeros([BT], dtype=tl.float32)
+    dots = tl.zeros([BT, NQP], dtype=tl.float32)
+    for c in range(0, D, CH):
+        offs = c + tl.arange(0, CH)
+        dmask = offs < D
+        mask2 = tmask[:, None] & dmask[None, :]
+        p2 = toks[:, None] * D + offs[None, :]
+        h = tl.load(H + p2, mask=mask2, other=0.0).to(tl.float32)
+        x = tl.load(X + p2, mask=mask2, other=0.0).to(tl.float32)
+        dlt = (h - x).to(V.dtype.element_ty)
+        tl.store(V + (S * n_tok + toks[:, None]) * D + offs[None, :], dlt, mask=mask2)
+        d32 = dlt.to(tl.float32)
+        ss += tl.sum(d32 * d32, axis=1)
+        qt = tl.load(QT + offs[:, None] * NQP + jj[None, :], mask=dmask[:, None], other=0.0)   # (CH, NQP), zero-padded
+        dots += tl.dot(d32, qt, input_precision="tf32x3")
+    tl.store(R + S * n_tok + toks, tl.rsqrt(ss / D + eps), mask=tmask)
+    tl.store(DOTS + (jj[None, :] * n_tok + toks[:, None]) * NS + S, dots, mask=tmask[:, None] & jmask[None, :])
+
+
+@triton.jit
+def _dattn_fwd_dots_kernel(V, R, DOTS, BASE, CBAR, C0, LC, MPTR, OUT, TC, LSE, LSE0, LG, n_tok, S, QI, NS, INV,
+                           D: tl.constexpr, CH: tl.constexpr, BT: tl.constexpr, GP: tl.constexpr):
+    pid_t = tl.program_id(0).to(tl.int64)
+    pid_c = tl.program_id(1)
+    toks = pid_t * BT + tl.arange(0, BT).to(tl.int64)
+    tmask = toks < n_tok
+    ii = tl.arange(0, GP)
+    imask = ii < S
+    m2 = tmask[:, None] & imask[None, :]
+    M = tl.load(MPTR)
+    lc = tl.load(LC + ii, mask=imask, other=0.0)
+    c0 = tl.load(C0 + ii, mask=imask, other=0.0)
+    r = tl.load(R + ii[None, :] * n_tok + toks[:, None], mask=m2, other=1.0)
+    dt = tl.load(DOTS + (QI * n_tok + toks[:, None]) * NS + ii[None, :], mask=m2, other=0.0)
+    cb = tl.load(CBAR + toks[:, None] * S + ii[None, :], mask=m2, other=0.0)
+    l = tl.where(m2, dt * r * INV + lc[None, :], float("-inf"))
+    mx = tl.max(l, axis=1)
+    lse = mx + tl.log(tl.sum(tl.where(m2, tl.exp(l - mx[:, None]), 0.0), axis=1))
+    l0 = tl.where(imask, lc, float("-inf"))
+    mx0 = tl.max(l0, axis=0)
+    lse0 = mx0 + tl.log(tl.sum(tl.where(imask, tl.exp(l0 - mx0), 0.0), axis=0))
+    tc = c0[None, :] + M * (tl.exp(l - lse[:, None]) - tl.exp(lc - lse0)[None, :])
+    w = tl.where(m2, tc - cb, 0.0)
+    if pid_c == 0:
+        tl.store(LG + toks[:, None] * S + ii[None, :], l, mask=m2)
+        tl.store(TC + toks[:, None] * S + ii[None, :], tc, mask=m2)
+        tl.store(LSE + toks, lse, mask=tmask)
+        tl.store(LSE0 + toks, tl.zeros([BT], dtype=tl.float32) + lse0, mask=tmask)
+    offs = pid_c * CH + tl.arange(0, CH)
+    dmask = offs < D
+    mask2 = tmask[:, None] & dmask[None, :]
+    acc = tl.load(BASE + toks[:, None] * D + offs[None, :], mask=mask2, other=0.0).to(tl.float32)
+    for i in range(0, S):
+        wi = tl.sum(tl.where((ii == i)[None, :], w, 0.0), axis=1)
+        v = tl.load(V + (i * n_tok + toks[:, None]) * D + offs[None, :], mask=mask2, other=0.0).to(tl.float32)
+        acc += wi[:, None] * v
+    tl.store(OUT + toks[:, None] * D + offs[None, :], acc.to(OUT.dtype.element_ty), mask=mask2)
+
+
+
 def _alias(stack_tensor: torch.Tensor, s: int) -> torch.Tensor:
     """Slice s of a stack as a tensor that shares its storage but is not an autograd view of it (set_ on a fresh
     tensor): later slices are written in place, and autograd forbids a custom Function to return a view whose base
@@ -553,15 +638,27 @@ def _alias(stack_tensor: torch.Tensor, s: int) -> torch.Tensor:
 
 class DattnStack:
     """The stacked storage of one forward pass: V[n_steps, b, t, d] (the updates), R[n_steps, b, t, 1] (their RMS
-    scales), and, from the first backward on, their gradient stacks dV / dR."""
-    __slots__ = ("V", "R", "dV", "dR", "n_steps", "n_tok", "d")
+    scales), and, from the first backward on, their gradient stacks dV / dR. Given `query` (the read queries,
+    (n_steps - 1, d); read s uses row s - 1) and the read's RMSNorm `eps`, each write also stores the update's RMS
+    scale and its dot products with every query, DOTS[n_queries, b * t, n_steps] fp32, and the reads use those (the
+    forward with stored scores; the queries are taken as they are when the stack is built, i.e. for one forward pass)."""
+    __slots__ = ("V", "R", "dV", "dR", "n_steps", "n_tok", "d", "eps", "Q", "QT", "DOTS", "r_done")
 
-    def __init__(self, n_steps: int, shape, dtype, device):
+    def __init__(self, n_steps: int, shape, dtype, device, query=None, eps: float = 1e-6):
         b, t, d = shape
         self.n_steps, self.n_tok, self.d = int(n_steps), b * t, d
         self.V = torch.empty((n_steps, b, t, d), dtype=dtype, device=device)
         self.R = torch.empty((n_steps, b, t, 1), dtype=torch.float32, device=device)
         self.dV = self.dR = None
+        self.eps = float(eps)
+        self.r_done = [False] * self.n_steps      # R[s] (and DOTS[:, :, s]) written by the write of update s
+        self.Q = self.QT = self.DOTS = None
+        if query is not None:
+            self.Q = query.detach().float().contiguous()
+            nqp = max(16, triton.next_power_of_2(self.Q.shape[0]))   # (d, NQP), zero-padded: the write's tl.dot operand
+            self.QT = torch.zeros((d, nqp), dtype=torch.float32, device=device)
+            self.QT[:, :self.Q.shape[0]] = self.Q.t()
+            self.DOTS = torch.empty((max(1, self.Q.shape[0]), b * t, self.n_steps), dtype=torch.float32, device=device)
 
     def write(self, s: int, h: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         """V[s] = h - x, returned as the update tensor (a view of the stack, with the autograd edge to h and x)."""
@@ -583,7 +680,14 @@ class _WriteDelta(torch.autograd.Function):
     @staticmethod
     def forward(ctx, stack: DattnStack, s: int, h: torch.Tensor, x: torch.Tensor):
         out = _alias(stack.V, s)
-        torch.sub(h, x, out=out)
+        if stack.Q is not None and h.is_contiguous() and x.is_contiguous() and h.dtype == stack.V.dtype == x.dtype:
+            _write_stk_kernel[(triton.cdiv(stack.n_tok, _WR_BT),)](h, x, stack.V, stack.R, stack.QT, stack.DOTS,
+                                                                   stack.n_tok, s, stack.Q.shape[0], stack.n_steps,
+                                                                   stack.eps, D=stack.d, CH=_WR_CH, BT=_WR_BT,
+                                                                   NQP=stack.QT.shape[1], num_warps=_WR_WARPS)
+            stack.r_done[s] = True
+        else:
+            torch.sub(h, x, out=out)
         return out
 
     @staticmethod
@@ -597,8 +701,9 @@ class _RstdStk(torch.autograd.Function):
         r = _alias(stack.R, s)
         d = x.shape[-1]
         block_d, block_t = _blocks(d)
-        _rstd_fwd_kernel[(triton.cdiv(stack.n_tok, block_t),)](x, r, stack.n_tok, eps, D=d, BLOCK_D=block_d,
-                                                               BLOCK_T=block_t, num_warps=4)
+        if not (stack.r_done[s] and eps == stack.eps):      # else the write already stored R[s]
+            _rstd_fwd_kernel[(triton.cdiv(stack.n_tok, block_t),)](x, r, stack.n_tok, eps, D=d, BLOCK_D=block_d,
+                                                                   BLOCK_T=block_t, num_warps=4)
         ctx.stack, ctx.s, ctx.x = stack, s, x
         return r
 
@@ -612,7 +717,9 @@ class _RstdStk(torch.autograd.Function):
         _rstd_bwd_acc_kernel[(triton.cdiv(stack.n_tok, block_t),)](x, stack.R[s], gr.contiguous(), stack.dV[s],
                                                                    stack.n_tok, D=d, BLOCK_D=block_d, BLOCK_T=block_t,
                                                                    num_warps=4)
-        return None, None, _alias(stack.dV, s), None
+        out = _alias(stack.dV, s)
+        ctx.stack = ctx.x = None          # release the stack from this node (see FusedDattnReadStk.backward)
+        return None, None, out, None
 
 
 class FusedDattnReadStk(torch.autograd.Function):
@@ -636,9 +743,17 @@ class FusedDattnReadStk(torch.autograd.Function):
         lse = torch.empty(n_tok, device=dev, dtype=torch.float32)
         lse0 = torch.empty(n_tok, device=dev, dtype=torch.float32)
         lg = torch.empty((n_tok, n), device=dev, dtype=torch.float32)
-        _dattn_fwd_stk_kernel[(triton.cdiv(n_tok, block_t),)](stack.V, stack.R, qc, base.detach(), cbar_c, c0c, lc, mvec,
-                                                              out, tc, lse, lse0, lg, n_tok, n, 1.0 / (d ** 0.5),
-                                                              D=d, BLOCK_D=block_d, BLOCK_T=block_t, num_warps=_FWD_WARPS)
+        if stack.DOTS is not None and step >= 1 and all(stack.r_done[:n]):
+            # the stored scores of query step - 1 (q is that query; the backward still uses it)
+            _dattn_fwd_dots_kernel[(triton.cdiv(n_tok, _FD_BT), triton.cdiv(d, _FD_CH))](
+                stack.V, stack.R, stack.DOTS, base.detach(), cbar_c, c0c, lc, mvec, out, tc, lse, lse0, lg, n_tok, n,
+                step - 1, stack.n_steps, 1.0 / (d ** 0.5), D=d, CH=_FD_CH, BT=_FD_BT, GP=triton.next_power_of_2(n),
+                num_warps=_FD_WARPS)
+        else:
+            _dattn_fwd_stk_kernel[(triton.cdiv(n_tok, block_t),)](stack.V, stack.R, qc, base.detach(), cbar_c, c0c, lc,
+                                                                  mvec, out, tc, lse, lse0, lg, n_tok, n, 1.0 / (d ** 0.5),
+                                                                  D=d, BLOCK_D=block_d, BLOCK_T=block_t,
+                                                                  num_warps=_FWD_WARPS)
         ctx.save_for_backward(qc, cbar_c, c0c, lc, mvec, lse, lse0, lg)
         ctx.stack, ctx.step, ctx.n, ctx.q_dtype, ctx.base_shape = stack, int(step), n, q.dtype, base.shape
         return out, tc.view(*base.shape[:-1], n)
@@ -669,5 +784,10 @@ class FusedDattnReadStk(torch.autograd.Function):
                                                                 ACCUM=bool(accum), num_warps=_BWD2_WARPS)
         dq = dq_part.sum(0).to(ctx.q_dtype)
         final = [i == step or (step == 1 and i == 0) for i in range(n)]   # the last read of scale i, in backward order
-        return (None, None, dq, g, dcbar.view(*ctx.base_shape[:-1], n), None,
-                *[None] * n, *[_alias(stack.dR, i) if final[i] else None for i in range(n)])
+        grads = (None, None, dq, g, dcbar.view(*ctx.base_shape[:-1], n), None,
+                 *[None] * n, *[_alias(stack.dR, i) if final[i] else None for i in range(n)])
+        # Release the stack (V, R, dV, dR) from this node: ctx attributes, unlike saved tensors, live as long as the
+        # graph node, and a training loop that keeps each micro-batch's loss until the optimizer step would otherwise
+        # keep every micro-batch's stack allocated.
+        ctx.stack = None
+        return grads

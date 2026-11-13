@@ -435,7 +435,7 @@ def main(job_config: JobConfig):
                     )
                     loss.backward()
 
-                losses.append(loss)
+                losses.append(loss.detach())   # the value only: the loss tensor would keep its graph until the step
             loss = sum(losses)
 
             # clip gradients

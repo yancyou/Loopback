@@ -72,7 +72,7 @@ $`(KR - 1)\,d`$ of them; the shared blocks are unchanged.
 | | |
 |---|---|
 | `looped_transformer.py` | the model in plain PyTorch (no fla / flash-attn / transformers): Standard, Plain Loop, Loopback and the eleven readers; loads the trainer's checkpoints |
-| `fused_dattn.py` | Loopback's read as one Triton kernel per read (`LOOP_DATTN_FUSED=1`); the reference read is the default. With it the trainer keeps the updates of a forward pass in one stack and accumulates their gradients inside the kernels (`LOOP_DATTN_STACK=1`, the default) |
+| `fused_dattn.py` | Loopback's read as one Triton kernel per read (`LOOP_DATTN_FUSED=1`); the reference read is the default. With it the trainer keeps the updates of a forward pass in one stack and accumulates their gradients inside the kernels (`LOOP_DATTN_STACK=1`, the default), and each write stores the update's scores against the read queries, so that a read is one pass over the stack (`LOOP_DATTN_DOTS=1`, the default) |
 | `loop_linattn_delta.py`, `loop_linattn_state.py` | the linear-attention readers on the loop axis over whole-iteration updates / stored states (linear attention, RetNet, Mamba-2, GLA, HGRN-2, DeltaNet, Gated DeltaNet, KDA, RWKV-7, LaCT-inspired, Mesa) |
 | `trainer/` | the flame (torchtitan) trainer the paper's runs executed, with the same model as a HuggingFace custom model, and the WSD ladder driver |
 | `configs/` | the configuration of every run the paper reports for these designs, at 191M / 374M / 778M / 1.4B / 3B and in the depth sweep (`configs/README.md`) |
@@ -147,9 +147,12 @@ whose pre-decay checkpoint the 20-TPP rung continues; one uninterrupted trajecto
 
 Loopback's fused read (`LOOP_DATTN_FUSED=1`, Triton) reproduces the reference read to fp32 round-off and is what the paper's
 throughput numbers use; without it the reference read runs (the checkpoints are the same either way). The released kernels
-are faster than the ones the paper's throughput table was measured with: they store the updates of a forward pass in one
-stack and accumulate their gradients in the kernels, with the same outputs bitwise; at 374M, one H100, Loopback's step time
-over Plain Loop's drops from 1.35x to 1.16x. `results/README.md` keeps the paper's measurements.
+are faster than the ones the paper's throughput table was measured with: they keep the updates of a forward pass in one
+stack, accumulate their gradients inside the kernels, and store each update's scores against the read queries when it is
+written, so that a read is one pass over the stack (outputs equal to fp32 round-off). With them, Loopback's training
+throughput on 8 H100s is 0.91x / 0.90x / 0.94x / 0.96x / 0.98x Standard's at 191M / 374M / 778M / 1.4B / 3B, with peak
+memory at most 4.5% above Standard's (374M: 29.1 vs 27.8 GiB per GPU). `results/README.md` keeps the paper's
+measurements.
 
 ## Evaluation
 
@@ -182,7 +185,8 @@ python scripts/eval_extra_visits.py --dump $RUN --step 7280 --config $CFG --toke
 python tests/test_looped_transformer_port.py
 # the fused read vs the reference read, kernel-level and whole-model (GPU)
 python tests/test_fused_dattn.py
-# the stacked layout of the fused read vs its list layout: forward and gradients bitwise (GPU)
+# the stacked layout of the fused read vs its list layout (bitwise; with stored scores, fp32 round-off), and that
+# a kept loss does not keep its pass's stack (GPU)
 python tests/test_dattn_stack.py
 # the read against the paper's equations: prior schedule, coefficients, Plain Loop at λ = 1
 python tests/test_loopback.py
